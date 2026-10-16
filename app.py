@@ -411,13 +411,15 @@ if st.session_state.credentials is None:
                     # Pass verifier in state as a backup in case session is lost
                     state=code_verifier,
                 )
-                # Same-tab redirect
-                import streamlit.components.v1 as components
-                components.html(
-                    f'<script>window.location.href = "{auth_url}";</script>',
-                    height=0,
+                btn_html = (
+                    '<a href="' + auth_url + '" target="_self" '
+                    'style="display:inline-block;padding:12px 24px;background:#4285F4;'
+                    'color:white;text-decoration:none;border-radius:6px;'
+                    'font-weight:bold;margin-top:10px;">'
+                    'Continue to Google Authorization</a>'
                 )
-                st.info("Redirecting to Google for authorization… Please wait.")
+                st.markdown(btn_html, unsafe_allow_html=True)
+                st.caption("Click the blue button above. You will be sent to Google, then brought back here.")
             except Exception as e:
                 st.error(f"Could not start login: {e}")
                 st.info("Make sure Client ID and Client Secret are correctly set in Streamlit Secrets.")
