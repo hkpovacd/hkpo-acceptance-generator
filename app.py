@@ -61,6 +61,7 @@ SHEET_NAME = "Participant Master"
 HEADER_ROW = 5  # 1-indexed
 NAME_COL_HEADER = "Name"
 STATUS_COL_HEADER = "Manual Status"
+EMAIL_COL_INDEX = 3  # Column D (0-based index)
 ACCEPTED_STATUS = "Accepted by HKPO"
 
 ACCEPTANCE_DRAFT_SUBJECT = "SkillBridge Acceptance - HKPO Veterans Academy"
@@ -615,44 +616,100 @@ def send_acceptance_email(
     return sent
 
 
-def update_participant_status(sheets_service, full_name: str) -> bool:
-    """Find row by Name and set Manual Status to Accepted by HKPO. Returns True if updated."""
+
+def _col_letter(idx0: int) -> str:
+    n = idx0 + 1
+    letters = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        letters = chr(65 + r) + letters
+    return letters
+
+
+def load_participants(sheets_service):
+    """Return list of dicts: {name, email, row_number, status} from Participant Master."""
     result = sheets_service.spreadsheets().values().get(
         spreadsheetId=SPREADSHEET_ID,
         range=f"'{SHEET_NAME}'",
     ).execute()
     values = result.get("values", [])
     if len(values) < HEADER_ROW:
-        return False
+        return []
 
     headers = [str(h).strip() for h in values[HEADER_ROW - 1]]
     try:
         name_idx = headers.index(NAME_COL_HEADER)
+    except ValueError:
+        return []
+
+    try:
         status_idx = headers.index(STATUS_COL_HEADER)
     except ValueError:
-        return False
+        status_idx = None
 
+    people = []
     for i in range(HEADER_ROW, len(values)):
         row = values[i]
-        if name_idx < len(row) and str(row[name_idx]).strip() == full_name:
-            # Sheet rows are 1-indexed; values index i is 0-based for the full grid
-            row_number = i + 1
-            # Column letter for status
-            # Convert 0-based index to column letter(s)
-            n = status_idx + 1
-            col_letter = ""
-            while n:
-                n, r = divmod(n - 1, 26)
-                col_letter = chr(65 + r) + col_letter
-            cell = f"'{SHEET_NAME}'!{col_letter}{row_number}"
-            sheets_service.spreadsheets().values().update(
-                spreadsheetId=SPREADSHEET_ID,
-                range=cell,
-                valueInputOption="USER_ENTERED",
-                body={"values": [[ACCEPTED_STATUS]]},
-            ).execute()
-            return True
-    return False
+        if name_idx >= len(row):
+            continue
+        name = str(row[name_idx]).strip()
+        if not name:
+            continue
+        email = ""
+        if EMAIL_COL_INDEX < len(row):
+            email = str(row[EMAIL_COL_INDEX]).strip()
+        status = ""
+        if status_idx is not None and status_idx < len(row):
+            status = str(row[status_idx]).strip()
+        people.append({
+            "name": name,
+            "email": email,
+            "row_number": i + 1,  # 1-based sheet row
+            "status": status,
+            "status_idx": status_idx,
+        })
+    return people
+
+
+def find_exact_participant(people, full_name: str):
+    for p in people:
+        if p["name"] == full_name:
+            return p
+    return None
+
+
+def suggest_participants(people, full_name: str, limit: int = 3):
+    """Return up to `limit` close name matches (case-insensitive, token overlap / containment)."""
+    from difflib import SequenceMatcher
+    needle = full_name.strip().lower()
+    if not needle:
+        return []
+
+    scored = []
+    for p in people:
+        name_l = p["name"].lower()
+        ratio = SequenceMatcher(None, needle, name_l).ratio()
+        # Boost if all tokens from the query appear in the name
+        tokens = [t for t in needle.split() if t]
+        if tokens and all(t in name_l for t in tokens):
+            ratio = max(ratio, 0.75)
+        if needle in name_l or name_l in needle:
+            ratio = max(ratio, 0.7)
+        if ratio >= 0.45:
+            scored.append((ratio, p))
+    scored.sort(key=lambda x: -x[0])
+    return [p for _, p in scored[:limit]]
+
+
+def set_status_on_row(sheets_service, row_number: int, status_idx: int) -> None:
+    col = _col_letter(status_idx)
+    cell = f"'{SHEET_NAME}'!{col}{row_number}"
+    sheets_service.spreadsheets().values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=cell,
+        valueInputOption="USER_ENTERED",
+        body={"values": [[ACCEPTED_STATUS]]},
+    ).execute()
 
 
 # ---------------------------------------------------------------------------
@@ -768,12 +825,6 @@ co_director = st.text_input(
     value="Matthew Hale",
 )
 
-applicant_email = st.text_input(
-    "Participant Email Address *",
-    placeholder="applicant@email.com",
-    help="Used for the acceptance email",
-)
-
 belt = st.selectbox(
     "Belt Level *",
     options=["Lean Practitioner", "Green Belt", "Black Belt"],
@@ -822,8 +873,6 @@ if generate_btn:
         errors.append("First and Last name are required.")
     if not co_director.strip():
         errors.append("Co-Director name is required.")
-    if do_email and (not applicant_email.strip() or "@" not in applicant_email):
-        errors.append("A valid participant email is required to send the acceptance email.")
     if end_date <= start_date:
         errors.append("End date must be after start date.")
     if not templates_ok:
@@ -843,6 +892,62 @@ if generate_btn:
                 first_clean = first.strip()
                 last_clean = last.strip()
                 full_name = f"{first_clean} {last_clean}"
+
+                # Resolve applicant from Participant Master (name + email from column D)
+                selected = st.session_state.get("selected_participant")
+                # Clear stale selection if name changed
+                if selected and selected.get("query_name") != full_name:
+                    selected = None
+                    st.session_state.selected_participant = None
+
+                if (do_email or do_status) and not selected:
+                    try:
+                        sheets = get_sheets_service(creds)
+                        people = load_participants(sheets)
+                        exact = find_exact_participant(people, full_name)
+                        if exact:
+                            selected = {**exact, "query_name": full_name}
+                            st.session_state.selected_participant = selected
+                        else:
+                            suggestions = suggest_participants(people, full_name, limit=3)
+                            st.warning(
+                                f"Exact match not found for **{full_name}** in Participant Master."
+                            )
+                            if not suggestions:
+                                st.error(
+                                    "No similar names found. Check spelling or add the person to the sheet."
+                                )
+                                st.stop()
+                            st.write("Did you mean one of these? Click to confirm:")
+                            for i, s in enumerate(suggestions):
+                                label = f"{s['name']}"
+                                if s.get("email"):
+                                    label += f"  ·  {s['email']}"
+                                if s.get("status"):
+                                    label += f"  ·  [{s['status']}]"
+                                if st.button(label, key=f"pick_{i}_{s['row_number']}"):
+                                    st.session_state.selected_participant = {
+                                        **s, "query_name": full_name
+                                    }
+                                    st.rerun()
+                            st.stop()
+                    except Exception as lookup_err:
+                        st.error(f"Could not look up participants: {lookup_err}")
+                        st.info("Enable Sheets API and re-login if needed.")
+                        st.stop()
+
+                if selected:
+                    st.info(
+                        f"Matched applicant: **{selected['name']}**"
+                        + (f" · {selected['email']}" if selected.get("email") else "")
+                    )
+                    if (do_email or do_status) and not selected.get("email"):
+                        st.error(
+                            f"No email found in column D for **{selected['name']}**. "
+                            "Add their email to the sheet and try again."
+                        )
+                        st.stop()
+
 
                 acc_bytes = generate_acceptance(first_clean, last_clean, start_dt, end_dt)
                 tp_bytes = generate_training_plan(
@@ -992,7 +1097,7 @@ if generate_btn:
                                 dates_str = format_email_dates(start_dt, end_dt)
                                 send_acceptance_email(
                                     gmail,
-                                    to_email=applicant_email.strip(),
+                                    to_email=selected['email'],
                                     first_name=first_clean,
                                     dates_str=dates_str,
                                     co_director=co_director.strip(),
@@ -1005,7 +1110,7 @@ if generate_btn:
                                     mou_name=mou_name,
                                 )
                                 st.success(
-                                    f"Acceptance email sent to **{applicant_email.strip()}** "
+                                    f"Acceptance email sent to **{selected['email']}** "
                                     f"(CC: director@hkpoveteransacademy.org) with PDF attachments"
                                     + (" + MOU" if include_mou else " (no MOU)")
                                 )
@@ -1017,23 +1122,26 @@ if generate_btn:
                                 )
 
                 # ---- Stage 3: Spreadsheet status ----
-                if do_status:
+                if do_status and selected:
                     st.markdown("---")
                     st.subheader("Spreadsheet Status")
                     with st.spinner("Updating Participant Master…"):
                         try:
                             sheets = get_sheets_service(creds)
-                            ok = update_participant_status(sheets, full_name)
-                            if ok:
+                            if selected.get("status_idx") is None:
+                                st.error("Could not find Manual Status column.")
+                            else:
+                                set_status_on_row(
+                                    sheets,
+                                    selected["row_number"],
+                                    selected["status_idx"],
+                                )
                                 st.success(
-                                    f"Manual Status for **{full_name}** set to "
+                                    f"Manual Status for **{selected['name']}** "
+                                    f"(row {selected['row_number']}) set to "
                                     f"**Accepted by HKPO**"
                                 )
-                            else:
-                                st.warning(
-                                    f"Could not find **{full_name}** in Participant Master "
-                                    f"(Name column). Status was not changed."
-                                )
+                                st.session_state.selected_participant = None
                         except Exception as sheet_err:
                             st.error(f"Sheets error: {sheet_err}")
                             st.info(
