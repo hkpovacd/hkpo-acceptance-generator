@@ -945,9 +945,38 @@ do_status = st.checkbox(
     value=True,
 )
 
+
+# ---- Name match confirmation (survives rerun) ----
+if st.session_state.get("name_suggestions"):
+    st.warning(st.session_state.get("name_suggest_msg", "Exact match not found."))
+    st.write("Did you mean one of these? Click to confirm:")
+    for i, s in enumerate(st.session_state["name_suggestions"]):
+        label = f"{s['name']}"
+        if s.get("email"):
+            label += f"  ·  {s['email']}"
+        if s.get("status"):
+            label += f"  ·  [{s['status']}]"
+        if st.button(label, key=f"pick_{i}_{s['row_number']}"):
+            query = st.session_state.get("pending_job", {}).get("full_name", "")
+            st.session_state.selected_participant = {**s, "query_name": query}
+            st.session_state.name_suggestions = None
+            st.session_state.name_suggest_msg = None
+            st.session_state.auto_run = True
+            st.rerun()
+    st.caption("After you click a name, processing will continue automatically.")
+    st.stop()
+
+if st.session_state.get("selected_participant"):
+    sel = st.session_state.selected_participant
+    st.success(
+        f"Selected applicant: **{sel['name']}**"
+        + (f" · {sel.get('email','')}" if sel.get("email") else "")
+    )
+
 generate_btn = st.button("Generate & Process", type="primary", use_container_width=True)
 
-if generate_btn:
+if generate_btn or st.session_state.get("auto_run"):
+    st.session_state.auto_run = False
     errors = []
     if not first.strip() or not last.strip():
         errors.append("First and Last name are required.")
@@ -973,9 +1002,23 @@ if generate_btn:
                 last_clean = last.strip()
                 full_name = f"{first_clean} {last_clean}"
 
+                # Save job inputs so a name-pick can resume the same run
+                st.session_state.pending_job = {
+                    "full_name": full_name,
+                    "first": first_clean,
+                    "last": last_clean,
+                    "co_director": co_director.strip(),
+                    "belt": belt,
+                    "pmp": pmp,
+                    "start": start_date.isoformat(),
+                    "end": end_date.isoformat(),
+                    "do_drive": do_drive,
+                    "do_email": do_email,
+                    "do_status": do_status,
+                }
+
                 # Resolve applicant from Participant Master (name + email from column D)
                 selected = st.session_state.get("selected_participant")
-                # Clear stale selection if name changed
                 if selected and selected.get("query_name") != full_name:
                     selected = None
                     st.session_state.selected_participant = None
@@ -990,27 +1033,17 @@ if generate_btn:
                             st.session_state.selected_participant = selected
                         else:
                             suggestions = suggest_participants(people, full_name, limit=3)
-                            st.warning(
-                                f"Exact match not found for **{full_name}** in Participant Master."
-                            )
                             if not suggestions:
                                 st.error(
-                                    "No similar names found. Check spelling or add the person to the sheet."
+                                    f"Exact match not found for **{full_name}**, and no similar "
+                                    "names were found. Check spelling or add the person to the sheet."
                                 )
                                 st.stop()
-                            st.write("Did you mean one of these? Click to confirm:")
-                            for i, s in enumerate(suggestions):
-                                label = f"{s['name']}"
-                                if s.get("email"):
-                                    label += f"  ·  {s['email']}"
-                                if s.get("status"):
-                                    label += f"  ·  [{s['status']}]"
-                                if st.button(label, key=f"pick_{i}_{s['row_number']}"):
-                                    st.session_state.selected_participant = {
-                                        **s, "query_name": full_name
-                                    }
-                                    st.rerun()
-                            st.stop()
+                            st.session_state.name_suggestions = suggestions
+                            st.session_state.name_suggest_msg = (
+                                f"Exact match not found for **{full_name}** in Participant Master."
+                            )
+                            st.rerun()
                     except Exception as lookup_err:
                         st.error(f"Could not look up participants: {lookup_err}")
                         st.info("Enable Sheets API and re-login if needed.")
@@ -1027,6 +1060,11 @@ if generate_btn:
                             "Add their email to the sheet and try again."
                         )
                         st.stop()
+                    # Use the sheet name for Drive folder matching (not the typed misspelling)
+                    full_name = selected["name"]
+                    parts = full_name.split(None, 1)
+                    first_clean = parts[0]
+                    last_clean = parts[1] if len(parts) > 1 else last_clean
 
 
                 acc_bytes = generate_acceptance(first_clean, last_clean, start_dt, end_dt)
