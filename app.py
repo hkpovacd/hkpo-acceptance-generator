@@ -46,7 +46,20 @@ ACCEPTED_FOLDER_ID = "1SQ_yDzpWCdzKfl6K_QA2UQWklCjipLYz"
 # OAuth scopes
 SCOPES = [
     "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/gmail.compose",
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/spreadsheets",
 ]
+
+# Spreadsheet
+SPREADSHEET_ID = "1opAbSoZE0fzejRyd-xm-nfdJOelBnL1gpQbrih3J9dE"
+SHEET_NAME = "Participant Master"
+HEADER_ROW = 5  # 1-indexed
+NAME_COL_HEADER = "Name"
+STATUS_COL_HEADER = "Manual Status"
+ACCEPTED_STATUS = "Accepted by HKPO"
+
+ACCEPTANCE_DRAFT_SUBJECT = "SkillBridge Acceptance - HKPO Veterans Academy"
 
 # Available templates: (duration_days, filename)
 TEMPLATES = {
@@ -326,15 +339,14 @@ def upload_file_to_folder(service, folder_id: str, filename: str, content: bytes
     return uploaded
 
 
+
 def move_folder(service, folder_id: str, new_parent_id: str):
-    # Get current parents
     file = service.files().get(
         fileId=folder_id,
         fields="parents",
         supportsAllDrives=True,
     ).execute()
     previous_parents = ",".join(file.get("parents", []))
-
     updated = service.files().update(
         fileId=folder_id,
         addParents=new_parent_id,
@@ -343,6 +355,208 @@ def move_folder(service, folder_id: str, new_parent_id: str):
         supportsAllDrives=True,
     ).execute()
     return updated
+
+
+def get_gmail_service(creds):
+    return build("gmail", "v1", credentials=creds, cache_discovery=False)
+
+
+def get_sheets_service(creds):
+    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+
+
+def format_email_dates(start: datetime, end: datetime) -> str:
+    """e.g. 12 October 2026 – 22 October 2027"""
+    def part(d):
+        return d.strftime("%d %B %Y").lstrip("0")
+    return f"{part(start)} – {part(end)}"
+
+
+def build_acceptance_email_html(first_name: str, dates_str: str, co_director: str) -> str:
+    return f"""Dear {first_name},<br><br>
+Congratulations! You have been officially accepted into the HKPO Veterans Academy. We are thrilled to welcome you into our upcoming Department of War SkillBridge cohort and look forward to supporting you throughout your transition.<br><br>
+Your program dates are&nbsp;{dates_str}.<br><br>
+Please find the following documents attached to support your SkillBridge application and coordination with your command:<br>
+<ul>
+<li>Official Acceptance Letter</li>
+<li>Training Plan</li>
+<li>DoD SkillBridge Memorandum of Understanding (MOU)</li>
+</ul>
+Kindly review these documents to ensure all details align with your requirements, including program dates.<br><br>
+At this stage, we are awaiting your command’s approval. Once approved, please email a copy of your signed DoD SkillBridge authorization document to our team for our records. After receipt, we will proceed with the remaining onboarding steps.<br><br>
+<strong>Next Steps</strong><br>
+Please begin preparing and submit the following items to&nbsp;director@hkpoveteransacademy.org:<br>
+<ul>
+<li>A copy of your command-approved SkillBridge package (once available)</li>
+<li>Point of contact information for your immediate supervisor and senior enlisted leader (name, rank, email, and phone number)</li>
+<li>A photo of yourself in uniform (informal photos are acceptable and used for cohort materials)</li>
+</ul>
+<strong>Share Your Acceptance</strong><br>
+We’ve also included an&nbsp;HKPO Veterans Academy acceptance badge/graphic&nbsp;for you to showcase your achievement on social media. Feel free to share and tag us—this helps expand awareness and support for transitioning service members.<br><br>
+<strong>Onboarding Session</strong><br>
+You will be scheduled for a brief&nbsp;30-minute onboarding session&nbsp;during the week prior to your start date, based on your availability. A Co-Director will reach out as your start date approaches to coordinate.<br><br>
+If you have any questions, please don’t hesitate to reach out. We are excited to have you join the program and are committed to supporting you every step of the way.<br><br>
+Warm regards,&nbsp;<br>
+{co_director}<br>
+Co-Director<br>
+HKPO Veterans Academy<br>
+A Nonprofit 501(c)3<br>
+Support HKPO Veterans Academy&nbsp;<br>
+Combined Federal Campaign (#43723)
+"""
+
+
+def build_acceptance_email_plain(first_name: str, dates_str: str, co_director: str) -> str:
+    return f"""Dear {first_name},
+
+Congratulations! You have been officially accepted into the HKPO Veterans Academy. We are thrilled to welcome you into our upcoming Department of War SkillBridge cohort and look forward to supporting you throughout your transition.
+
+Your program dates are {dates_str}.
+
+Please find the following documents attached to support your SkillBridge application and coordination with your command:
+* Official Acceptance Letter
+* Training Plan
+* DoD SkillBridge Memorandum of Understanding (MOU)
+
+Kindly review these documents to ensure all details align with your requirements, including program dates.
+
+At this stage, we are awaiting your command’s approval. Once approved, please email a copy of your signed DoD SkillBridge authorization document to our team for our records. After receipt, we will proceed with the remaining onboarding steps.
+
+Next Steps
+Please begin preparing and submit the following items to director@hkpoveteransacademy.org:
+* A copy of your command-approved SkillBridge package (once available)
+* Point of contact information for your immediate supervisor and senior enlisted leader (name, rank, email, and phone number)
+* A photo of yourself in uniform (informal photos are acceptable and used for cohort materials)
+
+Share Your Acceptance
+We’ve also included an HKPO Veterans Academy acceptance badge/graphic for you to showcase your achievement on social media. Feel free to share and tag us—this helps expand awareness and support for transitioning service members.
+
+Onboarding Session
+You will be scheduled for a brief 30-minute onboarding session during the week prior to your start date, based on your availability. A Co-Director will reach out as your start date approaches to coordinate.
+
+If you have any questions, please don’t hesitate to reach out. We are excited to have you join the program and are committed to supporting you every step of the way.
+
+Warm regards, 
+{co_director}
+Co-Director
+HKPO Veterans Academy
+A Nonprofit 501(c)3
+Support HKPO Veterans Academy 
+Combined Federal Campaign (#43723)
+"""
+
+
+def create_message_with_attachments(
+    to: str,
+    subject: str,
+    plain: str,
+    html: str,
+    attachments: list,
+    cc: str = None,
+    sender_name: str = "HKPO Veterans Academy",
+):
+    """attachments = list of (filename, bytes, mime_type)"""
+    import base64
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    from email.mime.base import MIMEBase
+    from email import encoders
+
+    msg = MIMEMultipart("mixed")
+    msg["To"] = to
+    msg["Subject"] = subject
+    if cc:
+        msg["Cc"] = cc
+    msg["From"] = sender_name
+
+    alt = MIMEMultipart("alternative")
+    alt.attach(MIMEText(plain, "plain"))
+    alt.attach(MIMEText(html, "html"))
+    msg.attach(alt)
+
+    for filename, content, mime_type in attachments:
+        maintype, subtype = mime_type.split("/", 1)
+        part = MIMEBase(maintype, subtype)
+        part.set_payload(content)
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition", "attachment", filename=filename)
+        msg.attach(part)
+
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    return {"raw": raw}
+
+
+def send_acceptance_email(
+    gmail_service,
+    to_email: str,
+    first_name: str,
+    dates_str: str,
+    co_director: str,
+    acc_bytes: bytes,
+    acc_name: str,
+    tp_bytes: bytes,
+    tp_name: str,
+):
+    subject = ACCEPTANCE_DRAFT_SUBJECT
+    plain = build_acceptance_email_plain(first_name, dates_str, co_director)
+    html = build_acceptance_email_html(first_name, dates_str, co_director)
+    attachments = [
+        (acc_name, acc_bytes, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        (tp_name, tp_bytes, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+    ]
+    # MOU is expected to already be on the user's draft; we compose fresh with the two docs.
+    # CC is included if the draft had it — we add director as CC for safety.
+    body = create_message_with_attachments(
+        to=to_email,
+        subject=subject,
+        plain=plain,
+        html=html,
+        attachments=attachments,
+        cc="director@hkpoveteransacademy.org",
+        sender_name=f"{co_director} | HKPO Veterans Academy",
+    )
+    sent = gmail_service.users().messages().send(userId="me", body=body).execute()
+    return sent
+
+
+def update_participant_status(sheets_service, full_name: str) -> bool:
+    """Find row by Name and set Manual Status to Accepted by HKPO. Returns True if updated."""
+    result = sheets_service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"'{SHEET_NAME}'",
+    ).execute()
+    values = result.get("values", [])
+    if len(values) < HEADER_ROW:
+        return False
+
+    headers = [str(h).strip() for h in values[HEADER_ROW - 1]]
+    try:
+        name_idx = headers.index(NAME_COL_HEADER)
+        status_idx = headers.index(STATUS_COL_HEADER)
+    except ValueError:
+        return False
+
+    for i in range(HEADER_ROW, len(values)):
+        row = values[i]
+        if name_idx < len(row) and str(row[name_idx]).strip() == full_name:
+            # Sheet rows are 1-indexed; values index i is 0-based for the full grid
+            row_number = i + 1
+            # Column letter for status
+            # Convert 0-based index to column letter(s)
+            n = status_idx + 1
+            col_letter = ""
+            while n:
+                n, r = divmod(n - 1, 26)
+                col_letter = chr(65 + r) + col_letter
+            cell = f"'{SHEET_NAME}'!{col_letter}{row_number}"
+            sheets_service.spreadsheets().values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=cell,
+                valueInputOption="USER_ENTERED",
+                body={"values": [[ACCEPTED_STATUS]]},
+            ).execute()
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +570,7 @@ st.set_page_config(
 
 st.title("HKPO Veterans Academy")
 st.subheader("Acceptance Letter & Training Plan Generator")
-st.caption("Stage 2 – Generate documents + upload to Google Drive + move folder")
+st.caption("Stage 3 – Generate + Drive + Email + Status update")
 
 # ---- Authentication ----
 if "credentials" not in st.session_state:
@@ -454,8 +668,14 @@ with col2:
     last = st.text_input("Participant Last Name *", placeholder="Weber")
 
 co_director = st.text_input(
-    "Co-Director Name (Training Plan signature)",
+    "Co-Director Name (Training Plan signature & email)",
     value="Matthew Hale",
+)
+
+applicant_email = st.text_input(
+    "Participant Email Address *",
+    placeholder="applicant@email.com",
+    help="Used for the acceptance email",
 )
 
 belt = st.selectbox(
@@ -484,12 +704,21 @@ else:
 st.markdown("---")
 
 do_drive = st.checkbox(
-    "Also upload to Google Drive and move folder to Accepted",
+    "Upload to Google Drive and move folder to Accepted",
     value=True,
     help="Finds the folder named 'First Last' in Submissions, uploads the documents, then moves the folder to Accepted – Awaiting Start Date."
 )
+do_email = st.checkbox(
+    "Send acceptance email",
+    value=True,
+    help="Sends the acceptance email with Acceptance Letter + Training Plan attached. MOU should already be on your Gmail draft workflow; this composes the personalized message.",
+)
+do_status = st.checkbox(
+    "Update spreadsheet status to Accepted by HKPO",
+    value=True,
+)
 
-generate_btn = st.button("Generate Documents", type="primary", use_container_width=True)
+generate_btn = st.button("Generate & Process", type="primary", use_container_width=True)
 
 if generate_btn:
     errors = []
@@ -497,6 +726,8 @@ if generate_btn:
         errors.append("First and Last name are required.")
     if not co_director.strip():
         errors.append("Co-Director name is required.")
+    if do_email and (not applicant_email.strip() or "@" not in applicant_email):
+        errors.append("A valid participant email is required to send the acceptance email.")
     if end_date <= start_date:
         errors.append("End date must be after start date.")
     if not templates_ok:
@@ -600,8 +831,64 @@ if generate_btn:
                                 "- Drive API is not enabled in the Google Cloud project"
                             )
 
+
+                # ---- Stage 3: Email ----
+                if do_email:
+                    st.markdown("---")
+                    st.subheader("Acceptance Email")
+                    with st.spinner("Sending acceptance email…"):
+                        try:
+                            gmail = get_gmail_service(creds)
+                            dates_str = format_email_dates(start_dt, end_dt)
+                            send_acceptance_email(
+                                gmail,
+                                to_email=applicant_email.strip(),
+                                first_name=first_clean,
+                                dates_str=dates_str,
+                                co_director=co_director.strip(),
+                                acc_bytes=acc_bytes,
+                                acc_name=acc_name,
+                                tp_bytes=tp_bytes,
+                                tp_name=tp_name,
+                            )
+                            st.success(
+                                f"Acceptance email sent to **{applicant_email.strip()}** "
+                                f"(CC: director@hkpoveteransacademy.org)"
+                            )
+                        except Exception as mail_err:
+                            st.error(f"Email error: {mail_err}")
+                            st.info(
+                                "Enable Gmail API in Google Cloud if needed, and re-login "
+                                "so the new Gmail permission is granted."
+                            )
+
+                # ---- Stage 3: Spreadsheet status ----
+                if do_status:
+                    st.markdown("---")
+                    st.subheader("Spreadsheet Status")
+                    with st.spinner("Updating Participant Master…"):
+                        try:
+                            sheets = get_sheets_service(creds)
+                            ok = update_participant_status(sheets, full_name)
+                            if ok:
+                                st.success(
+                                    f"Manual Status for **{full_name}** set to "
+                                    f"**Accepted by HKPO**"
+                                )
+                            else:
+                                st.warning(
+                                    f"Could not find **{full_name}** in Participant Master "
+                                    f"(Name column). Status was not changed."
+                                )
+                        except Exception as sheet_err:
+                            st.error(f"Sheets error: {sheet_err}")
+                            st.info(
+                                "Enable Google Sheets API in Google Cloud if needed, and "
+                                "re-login so the Sheets permission is granted."
+                            )
+
             except Exception as e:
                 st.error(f"Error while generating documents:\n\n{e}")
 
 st.markdown("---")
-st.caption("HKPO Veterans Academy • Co-Director Continuity Tool • Stage 2 of 3")
+st.caption("HKPO Veterans Academy • Co-Director Continuity Tool • Stage 3")
