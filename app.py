@@ -230,7 +230,7 @@ def get_redirect_uri():
     except Exception:
         pass
     # Fallback – user should have set the correct redirect URI
-    return "https://hkpo-acceptance-generator.streamlit.app/"
+    return "https://hkpo-acceptance-generator-ucqvpysmj6jpdsb4a4knny.streamlit.app/"
 
 
 def create_flow():
@@ -245,7 +245,7 @@ def create_flow():
             "auth_uri": "https://accounts.google.com/o/oauth2/auth",
             "token_uri": "https://oauth2.googleapis.com/token",
             "redirect_uris": [
-                "https://hkpo-acceptance-generator.streamlit.app/",
+                "https://hkpo-acceptance-generator-ucqvpysmj6jpdsb4a4knny.streamlit.app/",
                 "http://localhost:8501/",
             ],
         }
@@ -253,7 +253,7 @@ def create_flow():
 
     # Detect current URL for redirect
     # On Streamlit Cloud the redirect must match exactly what was registered
-    redirect_uri = "https://hkpo-acceptance-generator.streamlit.app/"
+    redirect_uri = "https://hkpo-acceptance-generator-ucqvpysmj6jpdsb4a4knny.streamlit.app/"
 
     flow = Flow.from_client_config(
         client_config,
