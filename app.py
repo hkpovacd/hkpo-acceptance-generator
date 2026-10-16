@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 HKPO Veterans Academy – Acceptance Letter & Training Plan Generator
-Streamlit Web Version (Stage 1)
+Streamlit Web Version (Stage 2: Generate + Drive upload + folder move)
 """
 
 import os
@@ -9,17 +9,28 @@ import re
 import shutil
 import subprocess
 import tempfile
+import json
 from datetime import datetime, date
 from pathlib import Path
-from copy import deepcopy
+from io import BytesIO
 
 import streamlit as st
 
 try:
     from docx import Document
 except ImportError:
-    st.error("Missing dependency. Run: `pip install python-docx`")
+    st.error("Missing dependency: python-docx")
     st.stop()
+
+# Google libraries (optional until login)
+try:
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import Flow
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseUpload
+    GOOGLE_AVAILABLE = True
+except ImportError:
+    GOOGLE_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -28,13 +39,20 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 TEMPLATE_ROOT = SCRIPT_DIR / "hkpo_templates"
 OUTPUT_DIR = SCRIPT_DIR / "output"
 
+# Google Drive folder IDs
+SUBMISSIONS_FOLDER_ID = "12MfLDc8Jb4m6b5ke6NaEdiN433SQ0MRV"
+ACCEPTED_FOLDER_ID = "1SQ_yDzpWCdzKfl6K_QA2UQWklCjipLYz"
+
+# OAuth scopes
+SCOPES = [
+    "https://www.googleapis.com/auth/drive",
+]
+
 # Available templates: (duration_days, filename)
 TEMPLATES = {
     "Lean Practitioner": {
-        False: [  # no PMP
-            (60, "lean_practitioner/60_day.docx"),
-        ],
-        True: []  # Lean Practitioner has no PMP variant
+        False: [(60, "lean_practitioner/60_day.docx")],
+        True: [],
     },
     "Green Belt": {
         False: [
@@ -68,7 +86,7 @@ ACCEPTANCE_TEMPLATE = TEMPLATE_ROOT / "acceptance" / "acceptance_letter.docx"
 
 
 # ---------------------------------------------------------------------------
-# Helpers (same logic as your original script)
+# Document generation helpers (unchanged logic)
 # ---------------------------------------------------------------------------
 def find_closest_template(belt: str, pmp: bool, approx_days: int):
     options = TEMPLATES.get(belt, {}).get(pmp, [])
@@ -76,8 +94,7 @@ def find_closest_template(belt: str, pmp: bool, approx_days: int):
         raise ValueError(
             f"No templates available for {belt} {'+ PMP' if pmp else '(no PMP)'}."
         )
-    best = min(options, key=lambda x: abs(x[0] - approx_days))
-    return best
+    return min(options, key=lambda x: abs(x[0] - approx_days))
 
 
 def format_date_long(dt: datetime) -> str:
@@ -122,74 +139,26 @@ def replace_everywhere(doc: Document, replacements: dict):
                     replace_in_paragraph(p, replacements)
 
 
-def _find_libreoffice() -> str | None:
-    import sys
-    for name in ("soffice", "libreoffice", "soffice.exe"):
-        if shutil.which(name):
-            return name
-    if sys.platform.startswith("win"):
-        candidates = [
-            Path(r"C:\Program Files\LibreOffice\program\soffice.exe"),
-            Path(r"C:\Program Files (x86)\LibreOffice\program\soffice.exe"),
-        ]
-        for p in candidates:
-            if p.exists():
-                return str(p)
-    mac_path = Path("/Applications/LibreOffice.app/Contents/MacOS/soffice")
-    if mac_path.exists():
-        return str(mac_path)
-    return None
-
-
-def convert_to_pdf(docx_path: Path, pdf_path: Path) -> bool:
-    lo = _find_libreoffice()
-    if not lo:
-        return False
-    out_dir = pdf_path.parent
-    try:
-        cmd = [
-            lo, "--headless", "--convert-to", "pdf",
-            "--outdir", str(out_dir), str(docx_path),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
-        generated = out_dir / (docx_path.stem + ".pdf")
-        if generated.exists() and generated != pdf_path:
-            generated.rename(pdf_path)
-        return pdf_path.exists()
-    except Exception:
-        return False
-
-
-def generate_acceptance(first: str, last: str, start: datetime, end: datetime,
-                        out_dir: Path) -> tuple[Path, Path]:
+def generate_acceptance(first: str, last: str, start: datetime, end: datetime) -> bytes:
     if not ACCEPTANCE_TEMPLATE.exists():
-        raise FileNotFoundError(
-            f"Acceptance letter template not found:\n{ACCEPTANCE_TEMPLATE}\n\n"
-            "Please place the template file at that location."
-        )
+        raise FileNotFoundError(f"Acceptance letter template not found: {ACCEPTANCE_TEMPLATE}")
     doc = Document(ACCEPTANCE_TEMPLATE)
     full_name = f"{first} {last}"
     date_str = format_acceptance_dates(start, end)
-
-    replacements = {
+    replace_everywhere(doc, {
         "First Last": full_name,
         "Month XX, 20XX through Month XX, 20XX": date_str,
-    }
-    replace_everywhere(doc, replacements)
-
-    base = f"{first} {last} - HKPO VA Letter"
-    docx_path = out_dir / f"{base}.docx"
-    pdf_path = out_dir / f"{base}.pdf"
-    doc.save(docx_path)
-    convert_to_pdf(docx_path, pdf_path)
-    return docx_path, pdf_path
+    })
+    buffer = BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
 def generate_training_plan(belt: str, pmp: bool, approx_days: int,
                            first: str, last: str,
                            start: datetime, end: datetime,
-                           co_director: str,
-                           out_dir: Path) -> tuple[Path, Path, int]:
+                           co_director: str) -> bytes:
     chosen_days, rel_path = find_closest_template(belt, pmp, approx_days)
     src = TEMPLATE_ROOT / rel_path
     if not src.exists():
@@ -200,7 +169,6 @@ def generate_training_plan(belt: str, pmp: bool, approx_days: int,
     date_str = f"{format_date_long(start)} – {format_date_long(end)}"
     actual_days = inclusive_days(start, end)
 
-    # Greeting
     for p in doc.paragraphs:
         if p.text.strip().startswith("Dear "):
             for run in p.runs:
@@ -211,16 +179,10 @@ def generate_training_plan(belt: str, pmp: bool, approx_days: int,
                 p.add_run(f"Dear {full_name},")
             break
 
-    # Course Dates
     for p in doc.paragraphs:
         txt = p.text
         if "Course Dates" in txt or "Course dates" in txt:
-            new = re.sub(
-                r"(Course Dates[:\s]*)(.*)",
-                rf"\1{date_str}",
-                txt,
-                flags=re.IGNORECASE,
-            )
+            new = re.sub(r"(Course Dates[:\s]*)(.*)", rf"\1{date_str}", txt, flags=re.IGNORECASE)
             for run in p.runs:
                 run.text = ""
             if p.runs:
@@ -228,16 +190,10 @@ def generate_training_plan(belt: str, pmp: bool, approx_days: int,
             else:
                 p.add_run(new)
 
-    # Length of Training
     for p in doc.paragraphs:
         txt = p.text
         if "Length of Training" in txt:
-            new = re.sub(
-                r"(Length of Training[:\s]*)(.*)",
-                rf"\g<1>{actual_days} days",
-                txt,
-                flags=re.IGNORECASE,
-            )
+            new = re.sub(r"(Length of Training[:\s]*)(.*)", rf"\g<1>{actual_days} days", txt, flags=re.IGNORECASE)
             for run in p.runs:
                 run.text = ""
             if p.runs:
@@ -245,7 +201,6 @@ def generate_training_plan(belt: str, pmp: bool, approx_days: int,
             else:
                 p.add_run(new)
 
-    # Co-Director name
     for p in doc.paragraphs:
         stripped = p.text.strip()
         if stripped in ("Will Roberts", "William Wingertsahn", "First Last", "Clay Gober", "Matthew Hale"):
@@ -258,12 +213,136 @@ def generate_training_plan(belt: str, pmp: bool, approx_days: int,
 
     replace_everywhere(doc, {"First Last": full_name})
 
-    base = f"{first} {last} - HKPO VA Training Plan"
-    docx_path = out_dir / f"{base}.docx"
-    pdf_path = out_dir / f"{base}.pdf"
-    doc.save(docx_path)
-    convert_to_pdf(docx_path, pdf_path)
-    return docx_path, pdf_path, actual_days
+    buffer = BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Google OAuth + Drive helpers
+# ---------------------------------------------------------------------------
+def get_redirect_uri():
+    """Return the current app URL for OAuth redirect."""
+    try:
+        # Streamlit Cloud sets this
+        return st.get_option("server.baseUrlPath") or ""
+    except Exception:
+        pass
+    # Fallback – user should have set the correct redirect URI
+    return "https://hkpo-acceptance-generator.streamlit.app/"
+
+
+def create_flow():
+    client_id = st.secrets["google"]["client_id"]
+    client_secret = st.secrets["google"]["client_secret"]
+
+    # Build a client config dict
+    client_config = {
+        "web": {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [
+                "https://hkpo-acceptance-generator.streamlit.app/",
+                "http://localhost:8501/",
+            ],
+        }
+    }
+
+    # Detect current URL for redirect
+    # On Streamlit Cloud the redirect must match exactly what was registered
+    redirect_uri = "https://hkpo-acceptance-generator.streamlit.app/"
+
+    flow = Flow.from_client_config(
+        client_config,
+        scopes=SCOPES,
+        redirect_uri=redirect_uri,
+    )
+    return flow
+
+
+def credentials_to_dict(creds: Credentials) -> dict:
+    return {
+        "token": creds.token,
+        "refresh_token": creds.refresh_token,
+        "token_uri": creds.token_uri,
+        "client_id": creds.client_id,
+        "client_secret": creds.client_secret,
+        "scopes": creds.scopes,
+    }
+
+
+def dict_to_credentials(info: dict) -> Credentials:
+    return Credentials(
+        token=info["token"],
+        refresh_token=info.get("refresh_token"),
+        token_uri=info["token_uri"],
+        client_id=info["client_id"],
+        client_secret=info["client_secret"],
+        scopes=info["scopes"],
+    )
+
+
+def get_drive_service(creds: Credentials):
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def find_folder_by_name(service, parent_id: str, folder_name: str):
+    """Return the folder ID of the first match, or None."""
+    query = (
+        f"'{parent_id}' in parents and "
+        f"name = '{folder_name}' and "
+        f"mimeType = 'application/vnd.google-apps.folder' and "
+        f"trashed = false"
+    )
+    results = service.files().list(
+        q=query,
+        spaces="drive",
+        fields="files(id, name)",
+        pageSize=10,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute()
+    files = results.get("files", [])
+    if not files:
+        return None
+    return files[0]["id"]
+
+
+def upload_file_to_folder(service, folder_id: str, filename: str, content: bytes, mime_type: str):
+    file_metadata = {
+        "name": filename,
+        "parents": [folder_id],
+    }
+    media = MediaIoBaseUpload(BytesIO(content), mimetype=mime_type, resumable=True)
+    uploaded = service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields="id, name",
+        supportsAllDrives=True,
+    ).execute()
+    return uploaded
+
+
+def move_folder(service, folder_id: str, new_parent_id: str):
+    # Get current parents
+    file = service.files().get(
+        fileId=folder_id,
+        fields="parents",
+        supportsAllDrives=True,
+    ).execute()
+    previous_parents = ",".join(file.get("parents", []))
+
+    updated = service.files().update(
+        fileId=folder_id,
+        addParents=new_parent_id,
+        removeParents=previous_parents,
+        fields="id, parents",
+        supportsAllDrives=True,
+    ).execute()
+    return updated
 
 
 # ---------------------------------------------------------------------------
@@ -277,29 +356,69 @@ st.set_page_config(
 
 st.title("HKPO Veterans Academy")
 st.subheader("Acceptance Letter & Training Plan Generator")
-st.caption("Stage 1 – Document generation (Drive upload & email coming next)")
+st.caption("Stage 2 – Generate documents + upload to Google Drive + move folder")
+
+# ---- Authentication ----
+if "credentials" not in st.session_state:
+    st.session_state.credentials = None
+
+# Handle OAuth callback
+query_params = st.query_params
+if "code" in query_params and st.session_state.credentials is None:
+    try:
+        flow = create_flow()
+        flow.fetch_token(code=query_params["code"])
+        creds = flow.credentials
+        st.session_state.credentials = credentials_to_dict(creds)
+        # Clear the code from URL
+        st.query_params.clear()
+        st.rerun()
+    except Exception as e:
+        st.error(f"Login failed: {e}")
+        st.stop()
+
+# Login / Logout UI
+if st.session_state.credentials is None:
+    st.info("Please log in with the shared **director@hkpoveteransacademy.org** account to enable Google Drive actions.")
+    if st.button("🔐 Login with Google", type="primary"):
+        if not GOOGLE_AVAILABLE:
+            st.error("Google libraries are missing. Check requirements.txt")
+        else:
+            try:
+                flow = create_flow()
+                auth_url, _ = flow.authorization_url(
+                    access_type="offline",
+                    include_granted_scopes="true",
+                    prompt="consent",
+                )
+                st.markdown(f"[Click here to authorize with Google]({auth_url})")
+                st.caption("After approving, you will be redirected back to this app.")
+            except Exception as e:
+                st.error(f"Could not start login: {e}")
+                st.info("Make sure Client ID and Client Secret are correctly set in Streamlit Secrets.")
+    st.stop()
+
+# Logged in
+creds = dict_to_credentials(st.session_state.credentials)
+col_a, col_b = st.columns([3, 1])
+with col_a:
+    st.success("Logged in with Google – Drive actions enabled")
+with col_b:
+    if st.button("Log out"):
+        st.session_state.credentials = None
+        st.rerun()
+
+st.markdown("---")
 
 # Sidebar status
 with st.sidebar:
     st.header("Status")
     templates_ok = TEMPLATE_ROOT.exists() and ACCEPTANCE_TEMPLATE.exists()
     if templates_ok:
-        st.success("Templates folder found")
+        st.success("Templates found")
     else:
-        st.error("Templates folder missing")
-        st.info(
-            "Place your templates in the `hkpo_templates` folder "
-            "inside this project (see README for exact structure)."
-        )
-
-    lo = _find_libreoffice()
-    if lo:
-        st.success("LibreOffice found – PDF conversion available")
-    else:
-        st.info("Running in cloud mode – generating .docx files only "
-                "(fully usable in Word / Google Docs). PDF can be added later.")
-
-st.markdown("---")
+        st.error("Templates missing")
+        st.info("Make sure hkpo_templates/ is in the GitHub repo.")
 
 # ---- Form ----
 col1, col2 = st.columns(2)
@@ -309,9 +428,8 @@ with col2:
     last = st.text_input("Participant Last Name *", placeholder="Weber")
 
 co_director = st.text_input(
-    "Co-Director Name (appears on Training Plan & email signature)",
+    "Co-Director Name (Training Plan signature)",
     value="Matthew Hale",
-    help="This name will be used on the Training Plan signature and in the acceptance email."
 )
 
 belt = st.selectbox(
@@ -330,7 +448,6 @@ with col3:
 with col4:
     end_date = st.date_input("Course End Date *", value=date.today())
 
-# Live duration
 if end_date > start_date:
     days = (end_date - start_date).days + 1
     st.info(f"Calculated duration: **{days} days** (inclusive)")
@@ -340,10 +457,15 @@ else:
 
 st.markdown("---")
 
+do_drive = st.checkbox(
+    "Also upload to Google Drive and move folder to Accepted",
+    value=True,
+    help="Finds the folder named 'First Last' in Submissions, uploads the documents, then moves the folder to Accepted – Awaiting Start Date."
+)
+
 generate_btn = st.button("Generate Documents", type="primary", use_container_width=True)
 
 if generate_btn:
-    # Validation
     errors = []
     if not first.strip() or not last.strip():
         errors.append("First and Last name are required.")
@@ -352,7 +474,7 @@ if generate_btn:
     if end_date <= start_date:
         errors.append("End date must be after start date.")
     if not templates_ok:
-        errors.append("Templates folder is missing. See sidebar for instructions.")
+        errors.append("Templates folder is missing.")
 
     if errors:
         for e in errors:
@@ -363,82 +485,97 @@ if generate_btn:
                 start_dt = datetime.combine(start_date, datetime.min.time())
                 end_dt = datetime.combine(end_date, datetime.min.time())
                 actual_days = inclusive_days(start_dt, end_dt)
-
                 chosen_days, rel = find_closest_template(belt, pmp, actual_days)
 
-                # Create output folder
-                person_dir = OUTPUT_DIR / f"{first.strip()} {last.strip()}"
-                person_dir.mkdir(parents=True, exist_ok=True)
+                first_clean = first.strip()
+                last_clean = last.strip()
+                full_name = f"{first_clean} {last_clean}"
 
-                # Generate
-                acc_docx, acc_pdf = generate_acceptance(
-                    first.strip(), last.strip(), start_dt, end_dt, person_dir
-                )
-                tp_docx, tp_pdf, used_days = generate_training_plan(
+                acc_bytes = generate_acceptance(first_clean, last_clean, start_dt, end_dt)
+                tp_bytes = generate_training_plan(
                     belt, pmp, actual_days,
-                    first.strip(), last.strip(),
-                    start_dt, end_dt, co_director.strip(),
-                    person_dir
+                    first_clean, last_clean,
+                    start_dt, end_dt, co_director.strip()
                 )
+
+                acc_name = f"{full_name} - HKPO VA Letter.docx"
+                tp_name = f"{full_name} - HKPO VA Training Plan.docx"
 
                 st.success("Documents generated successfully!")
                 st.write(f"**Template used:** `{rel}` (closest to {actual_days} days)")
-                st.write(f"**Output folder:** `{person_dir}`")
 
                 # Download buttons
                 st.markdown("### Download files")
-                col_a, col_b = st.columns(2)
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.download_button(
+                        "Download Acceptance Letter",
+                        acc_bytes,
+                        file_name=acc_name,
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    )
+                with c2:
+                    st.download_button(
+                        "Download Training Plan",
+                        tp_bytes,
+                        file_name=tp_name,
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    )
 
-                with col_a:
-                    st.markdown("**Acceptance Letter**")
-                    with open(acc_docx, "rb") as f:
-                        st.download_button(
-                            "Download .docx",
-                            f,
-                            file_name=acc_docx.name,
-                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        )
-                    if acc_pdf.exists():
-                        with open(acc_pdf, "rb") as f:
-                            st.download_button(
-                                "Download .pdf",
-                                f,
-                                file_name=acc_pdf.name,
-                                mime="application/pdf",
+                # ---- Drive actions ----
+                if do_drive:
+                    st.markdown("---")
+                    st.subheader("Google Drive")
+                    with st.spinner("Talking to Google Drive…"):
+                        try:
+                            service = get_drive_service(creds)
+
+                            folder_id = find_folder_by_name(
+                                service, SUBMISSIONS_FOLDER_ID, full_name
                             )
-                    else:
-                        st.caption("PDF not available in cloud mode (docx works in Word/Google Docs)")
 
-                with col_b:
-                    st.markdown("**Training Plan**")
-                    with open(tp_docx, "rb") as f:
-                        st.download_button(
-                            "Download .docx",
-                            f,
-                            file_name=tp_docx.name,
-                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        )
-                    if tp_pdf.exists():
-                        with open(tp_pdf, "rb") as f:
-                            st.download_button(
-                                "Download .pdf",
-                                f,
-                                file_name=tp_pdf.name,
-                                mime="application/pdf",
+                            if not folder_id:
+                                st.error(
+                                    f"Could not find a folder named **“{full_name}”** "
+                                    f"inside the Submissions folder.\n\n"
+                                    "Check the exact spelling (including spaces and capitalization) "
+                                    "and make sure the folder already exists in:\n"
+                                    "`1. Student Folders → 1.2 Submissions - Working`"
+                                )
+                            else:
+                                st.write(f"Found folder: **{full_name}**")
+
+                                # Upload both files
+                                upload_file_to_folder(
+                                    service, folder_id, acc_name, acc_bytes,
+                                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                                )
+                                st.write(f"✓ Uploaded `{acc_name}`")
+
+                                upload_file_to_folder(
+                                    service, folder_id, tp_name, tp_bytes,
+                                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                                )
+                                st.write(f"✓ Uploaded `{tp_name}`")
+
+                                # Move folder
+                                move_folder(service, folder_id, ACCEPTED_FOLDER_ID)
+                                st.success(
+                                    f"Folder **“{full_name}”** moved to "
+                                    f"**1.3 Accepted – Awaiting Start Date**"
+                                )
+
+                        except Exception as drive_err:
+                            st.error(f"Drive error: {drive_err}")
+                            st.info(
+                                "Common causes:\n"
+                                "- The login account does not have access to the Student Drive folders\n"
+                                "- The folder name does not match exactly\n"
+                                "- Drive API is not enabled in the Google Cloud project"
                             )
-                    else:
-                        st.caption("PDF not available in cloud mode (docx works in Word/Google Docs)")
-
-                st.info(
-                    "Next stage will automatically upload these files to the applicant’s "
-                    "Google Drive folder and move it to “Accepted – Awaiting Start Date”."
-                )
 
             except Exception as e:
                 st.error(f"Error while generating documents:\n\n{e}")
 
-# Footer
 st.markdown("---")
-st.caption(
-    "HKPO Veterans Academy • Co-Director Continuity Tool • Stage 1 of 3"
-)
+st.caption("HKPO Veterans Academy • Co-Director Continuity Tool • Stage 2 of 3")
