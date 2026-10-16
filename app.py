@@ -369,19 +369,24 @@ query_params = st.query_params
 if "code" in query_params and st.session_state.credentials is None:
     try:
         flow = create_flow()
-        # Restore the code_verifier that was saved before the redirect
-        if st.session_state.oauth_code_verifier:
-            flow.code_verifier = st.session_state.oauth_code_verifier
+        # Prefer the verifier saved in session; fall back to the one passed in state
+        verifier = st.session_state.oauth_code_verifier
+        if not verifier and "state" in query_params:
+            # state was used to carry the verifier
+            verifier = query_params.get("state")
+        if verifier:
+            flow.code_verifier = verifier
         flow.fetch_token(code=query_params["code"])
         creds = flow.credentials
         st.session_state.credentials = credentials_to_dict(creds)
         st.session_state.oauth_code_verifier = None
-        # Clear the code from URL
         st.query_params.clear()
         st.rerun()
     except Exception as e:
         st.error(f"Login failed: {e}")
         st.info("Try clicking Login with Google again.")
+        # Show debug info
+        st.write("Debug – code_verifier present:", bool(st.session_state.oauth_code_verifier))
         st.stop()
 
 # Login / Logout UI
@@ -393,15 +398,26 @@ if st.session_state.credentials is None:
         else:
             try:
                 flow = create_flow()
+                # Generate verifier first so we control it
+                import secrets
+                code_verifier = secrets.token_urlsafe(64)
+                flow.code_verifier = code_verifier
+                st.session_state.oauth_code_verifier = code_verifier
+
                 auth_url, _ = flow.authorization_url(
                     access_type="offline",
                     include_granted_scopes="true",
                     prompt="consent",
+                    # Pass verifier in state as a backup in case session is lost
+                    state=code_verifier,
                 )
-                # Save the code_verifier so we can use it after the redirect
-                st.session_state.oauth_code_verifier = flow.code_verifier
-                st.markdown(f"[Click here to authorize with Google]({auth_url})")
-                st.caption("After approving, you will be redirected back to this app.")
+                # Same-tab redirect
+                import streamlit.components.v1 as components
+                components.html(
+                    f'<script>window.location.href = "{auth_url}";</script>',
+                    height=0,
+                )
+                st.info("Redirecting to Google for authorization… Please wait.")
             except Exception as e:
                 st.error(f"Could not start login: {e}")
                 st.info("Make sure Client ID and Client Secret are correctly set in Streamlit Secrets.")
@@ -409,6 +425,7 @@ if st.session_state.credentials is None:
 
 # Logged in
 creds = dict_to_credentials(st.session_state.credentials)
+
 col_a, col_b = st.columns([3, 1])
 with col_a:
     st.success("Logged in with Google – Drive actions enabled")
