@@ -361,20 +361,27 @@ st.caption("Stage 2 – Generate documents + upload to Google Drive + move folde
 # ---- Authentication ----
 if "credentials" not in st.session_state:
     st.session_state.credentials = None
+if "oauth_code_verifier" not in st.session_state:
+    st.session_state.oauth_code_verifier = None
 
 # Handle OAuth callback
 query_params = st.query_params
 if "code" in query_params and st.session_state.credentials is None:
     try:
         flow = create_flow()
+        # Restore the code_verifier that was saved before the redirect
+        if st.session_state.oauth_code_verifier:
+            flow.code_verifier = st.session_state.oauth_code_verifier
         flow.fetch_token(code=query_params["code"])
         creds = flow.credentials
         st.session_state.credentials = credentials_to_dict(creds)
+        st.session_state.oauth_code_verifier = None
         # Clear the code from URL
         st.query_params.clear()
         st.rerun()
     except Exception as e:
         st.error(f"Login failed: {e}")
+        st.info("Try clicking Login with Google again.")
         st.stop()
 
 # Login / Logout UI
@@ -391,6 +398,8 @@ if st.session_state.credentials is None:
                     include_granted_scopes="true",
                     prompt="consent",
                 )
+                # Save the code_verifier so we can use it after the redirect
+                st.session_state.oauth_code_verifier = flow.code_verifier
                 st.markdown(f"[Click here to authorize with Google]({auth_url})")
                 st.caption("After approving, you will be redirected back to this app.")
             except Exception as e:
