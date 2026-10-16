@@ -42,6 +42,10 @@ OUTPUT_DIR = SCRIPT_DIR / "output"
 # Google Drive folder IDs
 SUBMISSIONS_FOLDER_ID = "12MfLDc8Jb4m6b5ke6NaEdiN433SQ0MRV"
 ACCEPTED_FOLDER_ID = "1SQ_yDzpWCdzKfl6K_QA2UQWklCjipLYz"
+MOU_FOLDER_ID = "1DnmnDamSHJDBBlKVo1tWzLYkDgbJ7ebV"
+# If start or end is after this date, do not attach MOU
+MOU_CUTOFF = date(2027, 5, 7)
+
 
 # OAuth scopes
 SCOPES = [
@@ -339,6 +343,94 @@ def upload_file_to_folder(service, folder_id: str, filename: str, content: bytes
     return uploaded
 
 
+def convert_docx_bytes_to_pdf(service, docx_bytes: bytes, base_name: str) -> bytes:
+    """
+    Convert DOCX to PDF using Google Drive:
+    upload as Google Doc -> export PDF -> delete temp Google Doc.
+    base_name is used for the temporary Google Doc name.
+    """
+    # Upload & convert to Google Doc
+    file_metadata = {
+        "name": f"_temp_{base_name}",
+        "mimeType": "application/vnd.google-apps.document",
+    }
+    media = MediaIoBaseUpload(
+        BytesIO(docx_bytes),
+        mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        resumable=True,
+    )
+    gdoc = service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields="id",
+        supportsAllDrives=True,
+    ).execute()
+    gdoc_id = gdoc["id"]
+    try:
+        pdf_bytes = service.files().export(
+            fileId=gdoc_id,
+            mimeType="application/pdf",
+        ).execute()
+        if isinstance(pdf_bytes, str):
+            pdf_bytes = pdf_bytes.encode("utf-8")
+        return pdf_bytes
+    finally:
+        try:
+            service.files().delete(fileId=gdoc_id, supportsAllDrives=True).execute()
+        except Exception:
+            pass
+
+
+def find_mou_file(service):
+    """Return (filename, file_id) of the first non-folder file in the MOU folder, or None."""
+    results = service.files().list(
+        q=f"'{MOU_FOLDER_ID}' in parents and trashed = false and mimeType != 'application/vnd.google-apps.folder'",
+        spaces="drive",
+        fields="files(id, name, mimeType)",
+        pageSize=20,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+        orderBy="modifiedTime desc",
+    ).execute()
+    files = results.get("files", [])
+    if not files:
+        return None
+    # Prefer a PDF if present
+    for f in files:
+        if f.get("mimeType") == "application/pdf" or f["name"].lower().endswith(".pdf"):
+            return f["name"], f["id"]
+    return files[0]["name"], files[0]["id"]
+
+
+def download_drive_file(service, file_id: str, mime_type_hint: str = None) -> bytes:
+    """Download a binary file from Drive (or export Google Doc as PDF)."""
+    meta = service.files().get(
+        fileId=file_id,
+        fields="mimeType, name",
+        supportsAllDrives=True,
+    ).execute()
+    mt = meta.get("mimeType", "")
+    if mt == "application/vnd.google-apps.document":
+        data = service.files().export(fileId=file_id, mimeType="application/pdf").execute()
+        return data if isinstance(data, bytes) else data.encode("utf-8")
+    # Regular file
+    from googleapiclient.http import MediaIoBaseDownload
+    buf = BytesIO()
+    request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+    downloader = MediaIoBaseDownload(buf, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    buf.seek(0)
+    return buf.read()
+
+
+def needs_mou(start_dt: datetime, end_dt: datetime) -> bool:
+    """False if start or end is after the MOU cutoff (May 7, 2027)."""
+    cutoff = datetime(MOU_CUTOFF.year, MOU_CUTOFF.month, MOU_CUTOFF.day)
+    return start_dt <= cutoff and end_dt <= cutoff
+
+
 
 def move_folder(service, folder_id: str, new_parent_id: str):
     file = service.files().get(
@@ -372,7 +464,8 @@ def format_email_dates(start: datetime, end: datetime) -> str:
     return f"{part(start)} – {part(end)}"
 
 
-def build_acceptance_email_html(first_name: str, dates_str: str, co_director: str) -> str:
+def build_acceptance_email_html(first_name: str, dates_str: str, co_director: str, include_mou: bool = True) -> str:
+    mou_li = "<li>DoD SkillBridge Memorandum of Understanding (MOU)</li>" if include_mou else ""
     return f"""Dear {first_name},<br><br>
 Congratulations! You have been officially accepted into the HKPO Veterans Academy. We are thrilled to welcome you into our upcoming Department of War SkillBridge cohort and look forward to supporting you throughout your transition.<br><br>
 Your program dates are&nbsp;{dates_str}.<br><br>
@@ -380,7 +473,7 @@ Please find the following documents attached to support your SkillBridge applica
 <ul>
 <li>Official Acceptance Letter</li>
 <li>Training Plan</li>
-<li>DoD SkillBridge Memorandum of Understanding (MOU)</li>
+{mou_li}
 </ul>
 Kindly review these documents to ensure all details align with your requirements, including program dates.<br><br>
 At this stage, we are awaiting your command’s approval. Once approved, please email a copy of your signed DoD SkillBridge authorization document to our team for our records. After receipt, we will proceed with the remaining onboarding steps.<br><br>
@@ -406,7 +499,8 @@ Combined Federal Campaign (#43723)
 """
 
 
-def build_acceptance_email_plain(first_name: str, dates_str: str, co_director: str) -> str:
+def build_acceptance_email_plain(first_name: str, dates_str: str, co_director: str, include_mou: bool = True) -> str:
+    mou_line = "* DoD SkillBridge Memorandum of Understanding (MOU)\n" if include_mou else ""
     return f"""Dear {first_name},
 
 Congratulations! You have been officially accepted into the HKPO Veterans Academy. We are thrilled to welcome you into our upcoming Department of War SkillBridge cohort and look forward to supporting you throughout your transition.
@@ -416,8 +510,7 @@ Your program dates are {dates_str}.
 Please find the following documents attached to support your SkillBridge application and coordination with your command:
 * Official Acceptance Letter
 * Training Plan
-* DoD SkillBridge Memorandum of Understanding (MOU)
-
+{mou_line}
 Kindly review these documents to ensure all details align with your requirements, including program dates.
 
 At this stage, we are awaiting your command’s approval. Once approved, please email a copy of your signed DoD SkillBridge authorization document to our team for our records. After receipt, we will proceed with the remaining onboarding steps.
@@ -492,20 +585,23 @@ def send_acceptance_email(
     first_name: str,
     dates_str: str,
     co_director: str,
-    acc_bytes: bytes,
-    acc_name: str,
-    tp_bytes: bytes,
-    tp_name: str,
+    acc_pdf: bytes,
+    acc_pdf_name: str,
+    tp_pdf: bytes,
+    tp_pdf_name: str,
+    include_mou: bool = True,
+    mou_bytes: bytes = None,
+    mou_name: str = None,
 ):
     subject = ACCEPTANCE_DRAFT_SUBJECT
-    plain = build_acceptance_email_plain(first_name, dates_str, co_director)
-    html = build_acceptance_email_html(first_name, dates_str, co_director)
+    plain = build_acceptance_email_plain(first_name, dates_str, co_director, include_mou=include_mou)
+    html = build_acceptance_email_html(first_name, dates_str, co_director, include_mou=include_mou)
     attachments = [
-        (acc_name, acc_bytes, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
-        (tp_name, tp_bytes, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        (acc_pdf_name, acc_pdf, "application/pdf"),
+        (tp_pdf_name, tp_pdf, "application/pdf"),
     ]
-    # MOU is expected to already be on the user's draft; we compose fresh with the two docs.
-    # CC is included if the draft had it — we add director as CC for safety.
+    if include_mou and mou_bytes and mou_name:
+        attachments.append((mou_name, mou_bytes, "application/pdf"))
     body = create_message_with_attachments(
         to=to_email,
         subject=subject,
@@ -779,7 +875,34 @@ if generate_btn:
                         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                     )
 
-                # ---- Drive actions ----
+                # PDF conversion + Drive + Email prep (needs Drive service)
+                acc_pdf = tp_pdf = None
+                acc_pdf_name = f"{full_name} - HKPO VA Letter.pdf"
+                tp_pdf_name = f"{full_name} - HKPO VA Training Plan.pdf"
+                include_mou = needs_mou(start_dt, end_dt)
+                mou_bytes = mou_name = None
+
+                if do_drive or do_email:
+                    st.markdown("---")
+                    st.subheader("PDF conversion")
+                    with st.spinner("Converting documents to PDF via Google Drive…"):
+                        try:
+                            service = get_drive_service(creds)
+                            acc_pdf = convert_docx_bytes_to_pdf(service, acc_bytes, acc_name)
+                            tp_pdf = convert_docx_bytes_to_pdf(service, tp_bytes, tp_name)
+                            st.success("PDF conversion complete")
+                        except Exception as pdf_err:
+                            st.error(f"PDF conversion error: {pdf_err}")
+                            st.info("Drive API must be enabled and the login account needs Drive access.")
+                            acc_pdf = tp_pdf = None
+
+                    if not include_mou:
+                        st.warning(
+                            f"**MOU notice:** Program dates for **{full_name}** extend past "
+                            f"May 7, 2027. The MOU was **not** attached. "
+                            f"Please provide this applicant with a copy of the next MOU."
+                        )
+
                 if do_drive:
                     st.markdown("---")
                     st.subheader("Google Drive")
@@ -802,7 +925,7 @@ if generate_btn:
                             else:
                                 st.write(f"Found folder: **{full_name}**")
 
-                                # Upload both files
+                                # Upload DOCX
                                 upload_file_to_folder(
                                     service, folder_id, acc_name, acc_bytes,
                                     "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -814,6 +937,18 @@ if generate_btn:
                                     "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                                 )
                                 st.write(f"✓ Uploaded `{tp_name}`")
+
+                                # Upload PDF if converted
+                                if acc_pdf:
+                                    upload_file_to_folder(
+                                        service, folder_id, acc_pdf_name, acc_pdf, "application/pdf"
+                                    )
+                                    st.write(f"✓ Uploaded `{acc_pdf_name}`")
+                                if tp_pdf:
+                                    upload_file_to_folder(
+                                        service, folder_id, tp_pdf_name, tp_pdf, "application/pdf"
+                                    )
+                                    st.write(f"✓ Uploaded `{tp_pdf_name}`")
 
                                 # Move folder
                                 move_folder(service, folder_id, ACCEPTED_FOLDER_ID)
@@ -831,36 +966,55 @@ if generate_btn:
                                 "- Drive API is not enabled in the Google Cloud project"
                             )
 
-
-                # ---- Stage 3: Email ----
+                # ---- Stage 3: Email (PDF only + optional MOU) ----
                 if do_email:
                     st.markdown("---")
                     st.subheader("Acceptance Email")
-                    with st.spinner("Sending acceptance email…"):
-                        try:
-                            gmail = get_gmail_service(creds)
-                            dates_str = format_email_dates(start_dt, end_dt)
-                            send_acceptance_email(
-                                gmail,
-                                to_email=applicant_email.strip(),
-                                first_name=first_clean,
-                                dates_str=dates_str,
-                                co_director=co_director.strip(),
-                                acc_bytes=acc_bytes,
-                                acc_name=acc_name,
-                                tp_bytes=tp_bytes,
-                                tp_name=tp_name,
-                            )
-                            st.success(
-                                f"Acceptance email sent to **{applicant_email.strip()}** "
-                                f"(CC: director@hkpoveteransacademy.org)"
-                            )
-                        except Exception as mail_err:
-                            st.error(f"Email error: {mail_err}")
-                            st.info(
-                                "Enable Gmail API in Google Cloud if needed, and re-login "
-                                "so the new Gmail permission is granted."
-                            )
+                    if not acc_pdf or not tp_pdf:
+                        st.error("Cannot send email – PDF conversion failed. Fix PDF conversion first.")
+                    else:
+                        with st.spinner("Sending acceptance email…"):
+                            try:
+                                service = get_drive_service(creds)
+                                if include_mou:
+                                    mou_info = find_mou_file(service)
+                                    if mou_info:
+                                        mou_name, mou_id = mou_info
+                                        mou_bytes = download_drive_file(service, mou_id)
+                                        if not mou_name.lower().endswith(".pdf"):
+                                            mou_name = mou_name.rsplit(".", 1)[0] + ".pdf"
+                                        st.write(f"Attached MOU: `{mou_name}`")
+                                    else:
+                                        st.warning("No file found in the MOU Drive folder – sending without MOU.")
+                                        include_mou = False
+
+                                gmail = get_gmail_service(creds)
+                                dates_str = format_email_dates(start_dt, end_dt)
+                                send_acceptance_email(
+                                    gmail,
+                                    to_email=applicant_email.strip(),
+                                    first_name=first_clean,
+                                    dates_str=dates_str,
+                                    co_director=co_director.strip(),
+                                    acc_pdf=acc_pdf,
+                                    acc_pdf_name=acc_pdf_name,
+                                    tp_pdf=tp_pdf,
+                                    tp_pdf_name=tp_pdf_name,
+                                    include_mou=include_mou,
+                                    mou_bytes=mou_bytes,
+                                    mou_name=mou_name,
+                                )
+                                st.success(
+                                    f"Acceptance email sent to **{applicant_email.strip()}** "
+                                    f"(CC: director@hkpoveteransacademy.org) with PDF attachments"
+                                    + (" + MOU" if include_mou else " (no MOU)")
+                                )
+                            except Exception as mail_err:
+                                st.error(f"Email error: {mail_err}")
+                                st.info(
+                                    "Enable Gmail API in Google Cloud if needed, and re-login "
+                                    "so the new Gmail permission is granted."
+                                )
 
                 # ---- Stage 3: Spreadsheet status ----
                 if do_status:
