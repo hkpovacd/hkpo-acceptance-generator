@@ -65,6 +65,7 @@ EMAIL_COL_INDEX = 3  # Column D (0-based index)
 ACCEPTED_STATUS = "Accepted by HKPO"
 
 ACCEPTANCE_DRAFT_SUBJECT = "SkillBridge Acceptance - HKPO Veterans Academy"
+ACCEPTANCE_CC = "clayagober@gmail.com"  # test CC; change later to director@
 
 # Available templates: (duration_days, filename)
 TEMPLATES = {
@@ -383,7 +384,7 @@ def convert_docx_bytes_to_pdf(service, docx_bytes: bytes, base_name: str) -> byt
 
 
 def find_mou_file(service):
-    """Return (filename, file_id) of the first non-folder file in the MOU folder, or None."""
+    """Return (filename, file_id) of a PDF (or first non-image) in the MOU folder."""
     results = service.files().list(
         q=f"'{MOU_FOLDER_ID}' in parents and trashed = false and mimeType != 'application/vnd.google-apps.folder'",
         spaces="drive",
@@ -396,11 +397,47 @@ def find_mou_file(service):
     files = results.get("files", [])
     if not files:
         return None
-    # Prefer a PDF if present
     for f in files:
-        if f.get("mimeType") == "application/pdf" or f["name"].lower().endswith(".pdf"):
+        name = f["name"].lower()
+        mt = f.get("mimeType", "")
+        if mt == "application/pdf" or name.endswith(".pdf"):
             return f["name"], f["id"]
-    return files[0]["name"], files[0]["id"]
+    # fallback: first non-image
+    for f in files:
+        mt = f.get("mimeType", "")
+        if not mt.startswith("image/"):
+            return f["name"], f["id"]
+    return None
+
+
+def find_graphic_file(service):
+    """Return (filename, file_id, mime_type) of an image in the MOU/assets folder."""
+    results = service.files().list(
+        q=f"'{MOU_FOLDER_ID}' in parents and trashed = false and mimeType != 'application/vnd.google-apps.folder'",
+        spaces="drive",
+        fields="files(id, name, mimeType)",
+        pageSize=20,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+        orderBy="modifiedTime desc",
+    ).execute()
+    files = results.get("files", [])
+    image_exts = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+    for f in files:
+        name = f["name"].lower()
+        mt = f.get("mimeType", "")
+        if mt.startswith("image/") or name.endswith(image_exts):
+            if not mt.startswith("image/"):
+                if name.endswith(".png"):
+                    mt = "image/png"
+                elif name.endswith((".jpg", ".jpeg")):
+                    mt = "image/jpeg"
+                elif name.endswith(".gif"):
+                    mt = "image/gif"
+                else:
+                    mt = "image/png"
+            return f["name"], f["id"], mt
+    return None
 
 
 def download_drive_file(service, file_id: str, mime_type_hint: str = None) -> bytes:
@@ -465,8 +502,12 @@ def format_email_dates(start: datetime, end: datetime) -> str:
     return f"{part(start)} – {part(end)}"
 
 
-def build_acceptance_email_html(first_name: str, dates_str: str, co_director: str, include_mou: bool = True) -> str:
+def build_acceptance_email_html(first_name: str, dates_str: str, co_director: str, include_mou: bool = True, graphic_cid: str = None) -> str:
     mou_li = "<li>DoD SkillBridge Memorandum of Understanding (MOU)</li>" if include_mou else ""
+    graphic_html = (
+        f'<br><br><img src="cid:{graphic_cid}" alt="HKPO Veterans Academy" style="max-width:320px;height:auto;" />'
+        if graphic_cid else ""
+    )
     return f"""Dear {first_name},<br><br>
 Congratulations! You have been officially accepted into the HKPO Veterans Academy. We are thrilled to welcome you into our upcoming Department of War SkillBridge cohort and look forward to supporting you throughout your transition.<br><br>
 Your program dates are&nbsp;{dates_str}.<br><br>
@@ -497,6 +538,7 @@ HKPO Veterans Academy<br>
 A Nonprofit 501(c)3<br>
 Support HKPO Veterans Academy&nbsp;<br>
 Combined Federal Campaign (#43723)
+{graphic_html}
 """
 
 
@@ -548,12 +590,17 @@ def create_message_with_attachments(
     attachments: list,
     cc: str = None,
     sender_name: str = "HKPO Veterans Academy",
+    inline_images: list = None,
 ):
-    """attachments = list of (filename, bytes, mime_type)"""
+    """
+    attachments = list of (filename, bytes, mime_type)
+    inline_images = list of (cid, filename, bytes, mime_type)
+    """
     import base64
     from email.mime.multipart import MIMEMultipart
     from email.mime.text import MIMEText
     from email.mime.base import MIMEBase
+    from email.mime.image import MIMEImage
     from email import encoders
 
     msg = MIMEMultipart("mixed")
@@ -563,10 +610,29 @@ def create_message_with_attachments(
         msg["Cc"] = cc
     msg["From"] = sender_name
 
-    alt = MIMEMultipart("alternative")
-    alt.attach(MIMEText(plain, "plain"))
-    alt.attach(MIMEText(html, "html"))
-    msg.attach(alt)
+    if inline_images:
+        related = MIMEMultipart("related")
+        alt = MIMEMultipart("alternative")
+        alt.attach(MIMEText(plain, "plain"))
+        alt.attach(MIMEText(html, "html"))
+        related.attach(alt)
+        for cid, filename, content, mime_type in inline_images:
+            maintype, subtype = mime_type.split("/", 1)
+            if maintype == "image":
+                img = MIMEImage(content, _subtype=subtype)
+            else:
+                img = MIMEBase(maintype, subtype)
+                img.set_payload(content)
+                encoders.encode_base64(img)
+            img.add_header("Content-ID", f"<{cid}>")
+            img.add_header("Content-Disposition", "inline", filename=filename)
+            related.attach(img)
+        msg.attach(related)
+    else:
+        alt = MIMEMultipart("alternative")
+        alt.attach(MIMEText(plain, "plain"))
+        alt.attach(MIMEText(html, "html"))
+        msg.attach(alt)
 
     for filename, content, mime_type in attachments:
         maintype, subtype = mime_type.split("/", 1)
@@ -593,24 +659,38 @@ def send_acceptance_email(
     include_mou: bool = True,
     mou_bytes: bytes = None,
     mou_name: str = None,
+    graphic_bytes: bytes = None,
+    graphic_name: str = None,
+    graphic_mime: str = None,
 ):
     subject = ACCEPTANCE_DRAFT_SUBJECT
+    graphic_cid = "hkpo_badge" if graphic_bytes else None
     plain = build_acceptance_email_plain(first_name, dates_str, co_director, include_mou=include_mou)
-    html = build_acceptance_email_html(first_name, dates_str, co_director, include_mou=include_mou)
+    html = build_acceptance_email_html(
+        first_name, dates_str, co_director,
+        include_mou=include_mou,
+        graphic_cid=graphic_cid,
+    )
     attachments = [
         (acc_pdf_name, acc_pdf, "application/pdf"),
         (tp_pdf_name, tp_pdf, "application/pdf"),
     ]
     if include_mou and mou_bytes and mou_name:
         attachments.append((mou_name, mou_bytes, "application/pdf"))
+
+    inline_images = None
+    if graphic_bytes and graphic_name and graphic_mime:
+        inline_images = [(graphic_cid, graphic_name, graphic_bytes, graphic_mime)]
+
     body = create_message_with_attachments(
         to=to_email,
         subject=subject,
         plain=plain,
         html=html,
         attachments=attachments,
-        cc="director@hkpoveteransacademy.org",
+        cc=ACCEPTANCE_CC,
         sender_name=f"{co_director} | HKPO Veterans Academy",
+        inline_images=inline_images,
     )
     sent = gmail_service.users().messages().send(userId="me", body=body).execute()
     return sent
@@ -1081,6 +1161,7 @@ if generate_btn:
                         with st.spinner("Sending acceptance email…"):
                             try:
                                 service = get_drive_service(creds)
+                                mou_bytes = mou_name = None
                                 if include_mou:
                                     mou_info = find_mou_file(service)
                                     if mou_info:
@@ -1090,8 +1171,17 @@ if generate_btn:
                                             mou_name = mou_name.rsplit(".", 1)[0] + ".pdf"
                                         st.write(f"Attached MOU: `{mou_name}`")
                                     else:
-                                        st.warning("No file found in the MOU Drive folder – sending without MOU.")
+                                        st.warning("No MOU PDF found in the assets folder – sending without MOU.")
                                         include_mou = False
+
+                                graphic_bytes = graphic_name = graphic_mime = None
+                                graphic_info = find_graphic_file(service)
+                                if graphic_info:
+                                    graphic_name, graphic_id, graphic_mime = graphic_info
+                                    graphic_bytes = download_drive_file(service, graphic_id)
+                                    st.write(f"Embedded graphic: `{graphic_name}`")
+                                else:
+                                    st.warning("No image graphic found in the assets folder – email will send without the badge.")
 
                                 gmail = get_gmail_service(creds)
                                 dates_str = format_email_dates(start_dt, end_dt)
@@ -1108,10 +1198,13 @@ if generate_btn:
                                     include_mou=include_mou,
                                     mou_bytes=mou_bytes,
                                     mou_name=mou_name,
+                                    graphic_bytes=graphic_bytes,
+                                    graphic_name=graphic_name,
+                                    graphic_mime=graphic_mime,
                                 )
                                 st.success(
                                     f"Acceptance email sent to **{selected['email']}** "
-                                    f"(CC: director@hkpoveteransacademy.org) with PDF attachments"
+                                    f"(CC: {ACCEPTANCE_CC}) with PDF attachments"
                                     + (" + MOU" if include_mou else " (no MOU)")
                                 )
                             except Exception as mail_err:
