@@ -65,7 +65,7 @@ EMAIL_COL_INDEX = 3  # Column D (0-based index)
 ACCEPTED_STATUS = "Accepted by HKPO"
 
 ACCEPTANCE_DRAFT_SUBJECT = "SkillBridge Acceptance - HKPO Veterans Academy"
-ACCEPTANCE_CC = "clayagober@gmail.com"  # test CC; change later to director@
+ACCEPTANCE_CC = "jralston@hkpoveteransacademy.org"
 
 # Available templates: (duration_days, filename)
 TEMPLATES = {
@@ -309,10 +309,12 @@ def get_drive_service(creds: Credentials):
 
 
 def find_folder_by_name(service, parent_id: str, folder_name: str):
-    """Return the folder ID of the first match, or None."""
+    """Return (id, name) of exact folder match, or None."""
+    # Escape single quotes in name for Drive query
+    safe = folder_name.replace("'", "''")
     query = (
         f"'{parent_id}' in parents and "
-        f"name = '{folder_name}' and "
+        f"name = '{safe}' and "
         f"mimeType = 'application/vnd.google-apps.folder' and "
         f"trashed = false"
     )
@@ -327,7 +329,54 @@ def find_folder_by_name(service, parent_id: str, folder_name: str):
     files = results.get("files", [])
     if not files:
         return None
-    return files[0]["id"]
+    return files[0]["id"], files[0]["name"]
+
+
+def list_submission_folders(service, parent_id: str):
+    """Return list of {id, name} for all folders under Submissions."""
+    folders = []
+    page_token = None
+    while True:
+        results = service.files().list(
+            q=(
+                f"'{parent_id}' in parents and "
+                f"mimeType = 'application/vnd.google-apps.folder' and "
+                f"trashed = false"
+            ),
+            spaces="drive",
+            fields="nextPageToken, files(id, name)",
+            pageSize=200,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+            pageToken=page_token,
+        ).execute()
+        for f in results.get("files", []):
+            folders.append({"id": f["id"], "name": f["name"]})
+        page_token = results.get("nextPageToken")
+        if not page_token:
+            break
+    return folders
+
+
+def suggest_folders(folders, query_name: str, limit: int = 3):
+    """Return up to `limit` close folder name matches."""
+    from difflib import SequenceMatcher
+    needle = query_name.strip().lower()
+    if not needle:
+        return []
+    scored = []
+    for f in folders:
+        name_l = f["name"].lower()
+        ratio = SequenceMatcher(None, needle, name_l).ratio()
+        tokens = [t for t in needle.split() if t]
+        if tokens and all(t in name_l for t in tokens):
+            ratio = max(ratio, 0.75)
+        if needle in name_l or name_l in needle:
+            ratio = max(ratio, 0.7)
+        if ratio >= 0.45:
+            scored.append((ratio, f))
+    scored.sort(key=lambda x: -x[0])
+    return [f for _, f in scored[:limit]]
 
 
 def upload_file_to_folder(service, folder_id: str, filename: str, content: bytes, mime_type: str):
@@ -946,30 +995,49 @@ do_status = st.checkbox(
 )
 
 
-# ---- Name match confirmation (survives rerun) ----
-if st.session_state.get("name_suggestions"):
-    st.warning(st.session_state.get("name_suggest_msg", "Exact match not found."))
-    st.write("Did you mean one of these? Click to confirm:")
-    for i, s in enumerate(st.session_state["name_suggestions"]):
+# ---- Folder / sheet match confirmation (survives rerun) ----
+# Folder suggestions first
+if st.session_state.get("folder_suggestions"):
+    st.warning(st.session_state.get("folder_suggest_msg", "Exact folder name not found."))
+    st.write("**Drive folder** – Did you mean one of these? Click to confirm:")
+    for i, f in enumerate(st.session_state["folder_suggestions"]):
+        if st.button(f"📁 {f['name']}", key=f"pick_folder_{i}_{f['id']}"):
+            query = st.session_state.get("pending_job", {}).get("form_name", "")
+            st.session_state.selected_folder = {**f, "query_name": query}
+            st.session_state.folder_suggestions = None
+            st.session_state.folder_suggest_msg = None
+            st.session_state.auto_run = True
+            st.rerun()
+    st.caption("After you click a folder, processing will continue (sheet match may come next).")
+    st.stop()
+
+# Sheet suggestions second
+if st.session_state.get("sheet_suggestions"):
+    st.warning(st.session_state.get("sheet_suggest_msg", "Exact spreadsheet name not found."))
+    st.write("**Spreadsheet row** – Did you mean one of these? Click to confirm:")
+    for i, s in enumerate(st.session_state["sheet_suggestions"]):
         label = f"{s['name']}"
         if s.get("email"):
             label += f"  ·  {s['email']}"
         if s.get("status"):
             label += f"  ·  [{s['status']}]"
-        if st.button(label, key=f"pick_{i}_{s['row_number']}"):
-            query = st.session_state.get("pending_job", {}).get("full_name", "")
+        if st.button(label, key=f"pick_sheet_{i}_{s['row_number']}"):
+            query = st.session_state.get("pending_job", {}).get("form_name", "")
             st.session_state.selected_participant = {**s, "query_name": query}
-            st.session_state.name_suggestions = None
-            st.session_state.name_suggest_msg = None
+            st.session_state.sheet_suggestions = None
+            st.session_state.sheet_suggest_msg = None
             st.session_state.auto_run = True
             st.rerun()
-    st.caption("After you click a name, processing will continue automatically.")
+    st.caption("After you click a row, processing will continue automatically.")
     st.stop()
+
+if st.session_state.get("selected_folder"):
+    st.success(f"Selected Drive folder: **{st.session_state.selected_folder['name']}**")
 
 if st.session_state.get("selected_participant"):
     sel = st.session_state.selected_participant
     st.success(
-        f"Selected applicant: **{sel['name']}**"
+        f"Selected spreadsheet row: **{sel['name']}**"
         + (f" · {sel.get('email','')}" if sel.get("email") else "")
     )
 
@@ -1000,11 +1068,11 @@ if generate_btn or st.session_state.get("auto_run"):
 
                 first_clean = first.strip()
                 last_clean = last.strip()
-                full_name = f"{first_clean} {last_clean}"
+                # Form spelling is always used for documents + email body
+                form_name = f"{first_clean} {last_clean}"
 
-                # Save job inputs so a name-pick can resume the same run
                 st.session_state.pending_job = {
-                    "full_name": full_name,
+                    "form_name": form_name,
                     "first": first_clean,
                     "last": last_clean,
                     "co_director": co_director.strip(),
@@ -1017,31 +1085,64 @@ if generate_btn or st.session_state.get("auto_run"):
                     "do_status": do_status,
                 }
 
-                # Resolve applicant from Participant Master (name + email from column D)
-                selected = st.session_state.get("selected_participant")
-                if selected and selected.get("query_name") != full_name:
-                    selected = None
+                # Clear stale selections if the typed name changed
+                sf = st.session_state.get("selected_folder")
+                if sf and sf.get("query_name") != form_name:
+                    st.session_state.selected_folder = None
+                    sf = None
+                sp = st.session_state.get("selected_participant")
+                if sp and sp.get("query_name") != form_name:
                     st.session_state.selected_participant = None
+                    sp = None
 
-                if (do_email or do_status) and not selected:
+                service = get_drive_service(creds) if (do_drive or do_email) else None
+
+                # ---- Drive folder match (exact, then suggest) ----
+                if do_drive and not sf:
+                    try:
+                        exact_folder = find_folder_by_name(service, SUBMISSIONS_FOLDER_ID, form_name)
+                        if exact_folder:
+                            folder_id, folder_name = exact_folder
+                            sf = {"id": folder_id, "name": folder_name, "query_name": form_name}
+                            st.session_state.selected_folder = sf
+                        else:
+                            folders = list_submission_folders(service, SUBMISSIONS_FOLDER_ID)
+                            suggestions = suggest_folders(folders, form_name, limit=3)
+                            if not suggestions:
+                                st.error(
+                                    f"No folder named **{form_name}** in Submissions, and no similar "
+                                    "folder names were found."
+                                )
+                                st.stop()
+                            st.session_state.folder_suggestions = suggestions
+                            st.session_state.folder_suggest_msg = (
+                                f"Exact folder name not found for **{form_name}** in Submissions."
+                            )
+                            st.rerun()
+                    except Exception as folder_err:
+                        st.error(f"Could not look up Drive folders: {folder_err}")
+                        st.stop()
+
+                # ---- Spreadsheet row match (exact, then suggest) ----
+                if (do_email or do_status) and not sp:
                     try:
                         sheets = get_sheets_service(creds)
                         people = load_participants(sheets)
-                        exact = find_exact_participant(people, full_name)
+                        exact = find_exact_participant(people, form_name)
                         if exact:
-                            selected = {**exact, "query_name": full_name}
-                            st.session_state.selected_participant = selected
+                            sp = {**exact, "query_name": form_name}
+                            st.session_state.selected_participant = sp
                         else:
-                            suggestions = suggest_participants(people, full_name, limit=3)
+                            suggestions = suggest_participants(people, form_name, limit=3)
                             if not suggestions:
                                 st.error(
-                                    f"Exact match not found for **{full_name}**, and no similar "
-                                    "names were found. Check spelling or add the person to the sheet."
+                                    f"Exact match not found for **{form_name}** in Participant Master, "
+                                    "and no similar names were found."
                                 )
                                 st.stop()
-                            st.session_state.name_suggestions = suggestions
-                            st.session_state.name_suggest_msg = (
-                                f"Exact match not found for **{full_name}** in Participant Master."
+                            st.session_state.sheet_suggestions = suggestions
+                            st.session_state.sheet_suggest_msg = (
+                                f"Exact spreadsheet name not found for **{form_name}**."
                             )
                             st.rerun()
                     except Exception as lookup_err:
@@ -1049,9 +1150,14 @@ if generate_btn or st.session_state.get("auto_run"):
                         st.info("Enable Sheets API and re-login if needed.")
                         st.stop()
 
+                selected = sp  # spreadsheet row (email + status)
+                selected_folder = sf  # drive folder
+
+                if selected_folder:
+                    st.info(f"Drive folder: **{selected_folder['name']}**")
                 if selected:
                     st.info(
-                        f"Matched applicant: **{selected['name']}**"
+                        f"Spreadsheet row: **{selected['name']}**"
                         + (f" · {selected['email']}" if selected.get("email") else "")
                     )
                     if (do_email or do_status) and not selected.get("email"):
@@ -1060,11 +1166,9 @@ if generate_btn or st.session_state.get("auto_run"):
                             "Add their email to the sheet and try again."
                         )
                         st.stop()
-                    # Use the sheet name for Drive folder matching (not the typed misspelling)
-                    full_name = selected["name"]
-                    parts = full_name.split(None, 1)
-                    first_clean = parts[0]
-                    last_clean = parts[1] if len(parts) > 1 else last_clean
+
+                # Documents + email body always use form spelling
+                full_name = form_name
 
 
                 acc_bytes = generate_acceptance(first_clean, last_clean, start_dt, end_dt)
@@ -1133,20 +1237,11 @@ if generate_btn or st.session_state.get("auto_run"):
                         try:
                             service = get_drive_service(creds)
 
-                            folder_id = find_folder_by_name(
-                                service, SUBMISSIONS_FOLDER_ID, full_name
-                            )
-
-                            if not folder_id:
-                                st.error(
-                                    f"Could not find a folder named **“{full_name}”** "
-                                    f"inside the Submissions folder.\n\n"
-                                    "Check the exact spelling (including spaces and capitalization) "
-                                    "and make sure the folder already exists in:\n"
-                                    "`1. Student Folders → 1.2 Submissions - Working`"
-                                )
+                            if not selected_folder:
+                                st.error("No Drive folder selected.")
                             else:
-                                st.write(f"Found folder: **{full_name}**")
+                                folder_id = selected_folder["id"]
+                                st.write(f"Using folder: **{selected_folder['name']}**")
 
                                 # Upload DOCX
                                 upload_file_to_folder(
@@ -1176,7 +1271,7 @@ if generate_btn or st.session_state.get("auto_run"):
                                 # Move folder
                                 move_folder(service, folder_id, ACCEPTED_FOLDER_ID)
                                 st.success(
-                                    f"Folder **“{full_name}”** moved to "
+                                    f"Folder **“{selected_folder['name']}”** moved to "
                                     f"**1.3 Accepted – Awaiting Start Date**"
                                 )
 
@@ -1273,6 +1368,7 @@ if generate_btn or st.session_state.get("auto_run"):
                                     f"**Accepted by HKPO**"
                                 )
                                 st.session_state.selected_participant = None
+                                st.session_state.selected_folder = None
                         except Exception as sheet_err:
                             st.error(f"Sheets error: {sheet_err}")
                             st.info(
