@@ -513,9 +513,9 @@ def download_drive_file(service, file_id: str, mime_type_hint: str = None) -> by
 
 
 def needs_mou(start_dt: datetime, end_dt: datetime) -> bool:
-    """False if start or end is after the MOU cutoff (May 7, 2027)."""
+    """True unless the program start date is after May 7, 2027."""
     cutoff = datetime(MOU_CUTOFF.year, MOU_CUTOFF.month, MOU_CUTOFF.day)
-    return start_dt <= cutoff and end_dt <= cutoff
+    return start_dt <= cutoff
 
 
 
@@ -1225,7 +1225,7 @@ if generate_btn or st.session_state.get("auto_run"):
 
                     if not include_mou:
                         st.warning(
-                            f"**MOU notice:** Program dates for **{full_name}** extend past "
+                            f"**MOU notice:** Start date for **{full_name}** is after "
                             f"May 7, 2027. The MOU was **not** attached. "
                             f"Please provide this applicant with a copy of the next MOU."
                         )
